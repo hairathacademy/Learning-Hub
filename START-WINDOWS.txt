@@ -1,0 +1,17 @@
+HAIRATH ACADEMY ADVANCED V7 - WINDOWS START
+
+1. Open Command Prompt in this folder.
+2. First time only: npm install
+3. Start: npm start
+4. Open: http://localhost:3000
+
+Admin default:
+Username: admin
+Password: ChangeMeNow!2026
+
+IMPORTANT:
+- Keep the CMD window open while using the website.
+- Admin can change the username/password from Admin & Settings.
+- Admin can create multiple admin accounts.
+- Student accounts are unlimited.
+- Video modal includes a YouTube fallback button if an embedded video is restricted.
