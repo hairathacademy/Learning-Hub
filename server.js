@@ -1,362 +1,1997 @@
 require('dotenv').config();
+
 const express = require('express');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
-const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
+const Database = require('better-sqlite3');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
+
 const PORT = Number(process.env.PORT || 3000);
-const db = new Database(process.env.DB_FILE ? path.resolve(process.env.DB_FILE) : path.join(__dirname,'course.db'));
-db.pragma('journal_mode = WAL');
 
-// Database schema + a small migration so empty student emails can be used repeatedly.
-db.exec(`
-CREATE TABLE IF NOT EXISTS users(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT UNIQUE NOT NULL,
-  email TEXT UNIQUE,
-  password_hash TEXT NOT NULL,
-  role TEXT NOT NULL DEFAULT 'student',
-  payment_status TEXT NOT NULL DEFAULT 'UNPAID',
-  access_level TEXT NOT NULL DEFAULT 'PREVIEW',
-  account_status TEXT NOT NULL DEFAULT 'ACTIVE',
-  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS login_history(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  user_id INTEGER NOT NULL,
-  username TEXT NOT NULL,
-  role TEXT NOT NULL,
-  login_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  logout_at TEXT,
-  FOREIGN KEY(user_id) REFERENCES users(id)
-);
-CREATE TABLE IF NOT EXISTS lesson_progress(
-  user_id INTEGER NOT NULL,
-  course_name TEXT NOT NULL,
-  video_index INTEGER NOT NULL,
-  watched_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY(user_id, course_name, video_index),
-  FOREIGN KEY(user_id) REFERENCES users(id)
-);
-`);
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SECRET_KEY =
+  process.env.SUPABASE_SECRET_KEY ||
+  process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// Migrate the original NOT NULL email schema to a nullable unique email column.
-const emailInfo = db.prepare("PRAGMA table_info(users)").all().find(c => c.name === 'email');
-if (emailInfo && emailInfo.notnull === 1) {
-  const columns = db.prepare("PRAGMA table_info(users)").all();
-  const hasCreated = columns.some(c => c.name === 'created_at');
-  db.transaction(() => {
-    db.exec(`CREATE TABLE users_new(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT UNIQUE NOT NULL,
-      email TEXT UNIQUE,
-      password_hash TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'student',
-      payment_status TEXT NOT NULL DEFAULT 'UNPAID',
-      access_level TEXT NOT NULL DEFAULT 'PREVIEW',
-      account_status TEXT NOT NULL DEFAULT 'ACTIVE',
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )`);
-    db.exec(`INSERT INTO users_new(id,username,email,password_hash,role,payment_status,access_level,account_status,created_at)
-      SELECT id,username,NULLIF(email,''),password_hash,role,payment_status,access_level,account_status,${hasCreated ? 'created_at' : 'CURRENT_TIMESTAMP'} FROM users`);
-    db.exec('DROP TABLE users');
-    db.exec('ALTER TABLE users_new RENAME TO users');
-  })();
+if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+  console.error('ERROR: Supabase environment variables are missing.');
+  console.error('Required: SUPABASE_URL and SUPABASE_SECRET_KEY');
+  process.exit(1);
 }
 
-const adminUsername = process.env.ADMIN_USERNAME || 'admin';
-const adminEmail = process.env.ADMIN_EMAIL || 'admin@example.com';
-const adminPassword = process.env.ADMIN_PASSWORD || 'ChangeMeNow!2026';
-const adminManagePassword = process.env.ADMIN_MANAGE_PASSWORD || '3833';
-const seed = db.prepare('SELECT id FROM users WHERE username=?').get(adminUsername);
-if (!seed) {
-  const hash = bcrypt.hashSync(adminPassword, 12);
-  db.prepare('INSERT INTO users(username,email,password_hash,role,payment_status,access_level,account_status) VALUES(?,?,?,?,?,?,?)')
-    .run(adminUsername, adminEmail, hash, 'admin', 'PAID', 'FULL_COURSE', 'ACTIVE');
-}
-
-db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('whatsapp_number',?)")
-  .run(process.env.WHATSAPP_NUMBER || '94777122951');
-db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('academy_name',?)").run('HAIRATH ACADEMY');
-db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('academy_tagline',?)").run('RESEARCH AND EDUCATION DEVELOPMENT');
-db.prepare("INSERT OR IGNORE INTO settings(key,value) VALUES('facebook_url',?)").run('https://www.facebook.com/HairathAcademy/');
-const coursesFile = path.join(__dirname,'data','courses.json');
-function readSeedCourses(){
-  try { return fs.existsSync(coursesFile) ? JSON.parse(fs.readFileSync(coursesFile,'utf8')) : []; }
-  catch { return []; }
-}
-function getCourses(){
-  const row=db.prepare("SELECT value FROM settings WHERE key='courses_json'").get();
-  try{
-    const parsed=row ? JSON.parse(row.value) : [];
-    if(Array.isArray(parsed) && parsed.length) return parsed;
-  }catch{}
-  const seedCourses=readSeedCourses();
-  if(seedCourses.length) {
-    db.prepare("INSERT INTO settings(key,value) VALUES('courses_json',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(seedCourses));
-  }
-  return seedCourses;
-}
-function saveCourses(courses){
-  db.prepare("INSERT INTO settings(key,value) VALUES('courses_json',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(courses));
-}
-function getSetting(key, fallback=''){return db.prepare('SELECT value FROM settings WHERE key=?').get(key)?.value ?? fallback;}
-
-app.use(express.json({limit:'5mb'}));
-
-// Lightweight CORS support so the app can still reach the local API if a browser
-// accidentally opens the HTML from a file:// origin. Same-origin requests are unaffected.
-app.use((req,res,next)=>{
-  const origin=req.headers.origin;
-  if(origin){
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary','Origin');
-    res.setHeader('Access-Control-Allow-Credentials','true');
-    res.setHeader('Access-Control-Allow-Headers','Content-Type');
-    res.setHeader('Access-Control-Allow-Methods','GET,POST,PUT,OPTIONS');
-  }
-  if(req.method==='OPTIONS') return res.sendStatus(204);
-  next();
-});
-app.use(session({
-  secret: process.env.SESSION_SECRET || 'replace-this-secret',
-  resave: false,
-  saveUninitialized: false,
-  cookie: { httpOnly:true, sameSite:'lax', secure:process.env.NODE_ENV==='production', maxAge:1000*60*60*24*7 }
-}));
-app.use(express.static(path.join(__dirname,'public')));
-
-function safe(u){
-  return {id:u.id,username:u.username,email:u.email||'',role:u.role,payment_status:u.payment_status,access_level:u.access_level,account_status:u.account_status,created_at:u.created_at};
-}
-function currentUser(req){ return req.session.userId ? db.prepare('SELECT * FROM users WHERE id=?').get(req.session.userId) : null; }
-function admin(req,res,next){
-  const u=currentUser(req);
-  if(!u || u.role!=='admin' || u.account_status!=='ACTIVE') return res.status(403).json({error:'Admin access required'});
-  next();
-}
-function adminManage(req,res,next){
-  const u=currentUser(req);
-  if(!u || u.role!=='admin' || u.account_status!=='ACTIVE') return res.status(403).json({error:'Admin access required'});
-  const supplied=String(req.body?.manage_password||'');
-  if(supplied!==adminManagePassword) return res.status(403).json({error:'Management password is incorrect.'});
-  next();
-}
-
-app.post('/api/admin/verify-management',admin,(req,res)=>{
-  const supplied=String(req.body?.manage_password||'');
-  if(supplied!==adminManagePassword) return res.status(403).json({error:'Management password is incorrect.'});
-  res.json({ok:true});
-});
-
-app.get('/api/health',(req,res)=>res.json({ok:true,service:'hairath-academy-course-platform'}));
-
-app.get('/api/config',(req,res)=>res.json({whatsapp_number:getSetting('whatsapp_number'),academy_name:getSetting('academy_name','HAIRATH ACADEMY'),academy_tagline:getSetting('academy_tagline','RESEARCH AND EDUCATION DEVELOPMENT'),facebook_url:getSetting('facebook_url','https://www.facebook.com/HairathAcademy/')}));
-app.get('/api/courses',(req,res)=>res.json({courses:getCourses()}));
-app.get('/api/me',(req,res)=>res.json({user:currentUser(req)?safe(currentUser(req)):null}));
-
-app.post('/api/login',(req,res)=>{
-  const username=String(req.body?.username||'').trim();
-  const password=String(req.body?.password||'');
-  const u=db.prepare('SELECT * FROM users WHERE username=? OR email=?').get(username,username);
-  if(!u || u.account_status!=='ACTIVE' || !bcrypt.compareSync(password,u.password_hash))
-    return res.status(401).json({error:'Invalid username/email or password.'});
-  req.session.userId=u.id;
-  const hist=db.prepare('INSERT INTO login_history(user_id,username,role) VALUES(?,?,?)').run(u.id,u.username,u.role);
-  req.session.loginHistoryId=hist.lastInsertRowid;
-  res.json({user:safe(u)});
-});
-app.post('/api/logout',(req,res)=>{
-  const hid=req.session.loginHistoryId;
-  if(hid) db.prepare('UPDATE login_history SET logout_at=CURRENT_TIMESTAMP WHERE id=? AND logout_at IS NULL').run(hid);
-  req.session.destroy(()=>res.json({ok:true}));
-});
-
-// All student records, not just one row.
-app.get('/api/admin/students',admin,(req,res)=>{
-  const students=db.prepare("SELECT id,username,email,payment_status,access_level,account_status,created_at FROM users WHERE role='student' ORDER BY id DESC").all();
-  res.json({students});
-});
-
-app.post('/api/admin/students',admin,(req,res)=>{
-  const username=String(req.body?.username||'').trim();
-  const email=String(req.body?.email||'').trim() || null;
-  const password=String(req.body?.password||'');
-  const payment_status=req.body?.payment_status||'PAID';
-  const access_level=req.body?.access_level||'FULL_COURSE';
-  const account_status=req.body?.account_status||'ACTIVE';
-  if(!username || !password) return res.status(400).json({error:'Username and password are required.'});
-  if(!/^[A-Za-z0-9._-]{3,50}$/.test(username)) return res.status(400).json({error:'Username must be 3-50 characters (letters, numbers, dot, underscore or hyphen).'});
-  if(password.length<4) return res.status(400).json({error:'Password must contain at least 4 characters.'});
-  if(!['PAID','UNPAID'].includes(payment_status)||!['FULL_COURSE','PREVIEW'].includes(access_level)||!['ACTIVE','SUSPENDED'].includes(account_status)) return res.status(400).json({error:'Invalid account values.'});
-  try{
-    const hash=bcrypt.hashSync(password,12);
-    const r=db.prepare('INSERT INTO users(username,email,password_hash,role,payment_status,access_level,account_status) VALUES(?,?,?,?,?,?,?)')
-      .run(username,email,hash,'student',payment_status,access_level,account_status);
-    const student=db.prepare('SELECT id,username,email,payment_status,access_level,account_status,created_at FROM users WHERE id=?').get(r.lastInsertRowid);
-    res.json({student});
-  }catch(e){ res.status(409).json({error:'Username or email already exists.'}); }
-});
-
-app.put('/api/admin/students/:id',admin,(req,res)=>{
-  const id=Number(req.params.id);
-  const existing=db.prepare("SELECT * FROM users WHERE id=? AND role='student'").get(id);
-  if(!existing) return res.status(404).json({error:'Student not found.'});
-  const username=String(req.body?.username ?? existing.username).trim();
-  const email=String(req.body?.email ?? existing.email ?? '').trim() || null;
-  const payment_status=req.body?.payment_status ?? existing.payment_status;
-  const access_level=req.body?.access_level ?? existing.access_level;
-  const account_status=req.body?.account_status ?? existing.account_status;
-  const newPassword=String(req.body?.password||'');
-  if(!username) return res.status(400).json({error:'Username is required.'});
-  if(!['PAID','UNPAID'].includes(payment_status)||!['FULL_COURSE','PREVIEW'].includes(access_level)||!['ACTIVE','SUSPENDED'].includes(account_status)) return res.status(400).json({error:'Invalid account values.'});
-  try{
-    if(newPassword){
-      if(newPassword.length<4) return res.status(400).json({error:'Password must contain at least 4 characters.'});
-      const hash=bcrypt.hashSync(newPassword,12);
-      db.prepare('UPDATE users SET username=?,email=?,password_hash=?,payment_status=?,access_level=?,account_status=? WHERE id=?')
-        .run(username,email,hash,payment_status,access_level,account_status,id);
-    } else {
-      db.prepare('UPDATE users SET username=?,email=?,payment_status=?,access_level=?,account_status=? WHERE id=?')
-        .run(username,email,payment_status,access_level,account_status,id);
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_SECRET_KEY,
+  {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false
     }
-    res.json({student:db.prepare('SELECT id,username,email,payment_status,access_level,account_status,created_at FROM users WHERE id=?').get(id)});
-  }catch(e){ res.status(409).json({error:'Username or email already exists.'}); }
-});
+  }
+);
 
-app.get('/api/admin/login-history',admin,(req,res)=>{
-  const rows=db.prepare(`SELECT id,username,role,login_at,logout_at FROM login_history ORDER BY id DESC LIMIT 500`).all();
-  res.json({history:rows});
-});
+const appData = {
+  academy_name: 'HAIRATH ACADEMY',
+  academy_tagline: 'FOR RESEARCH AND EDUCATION DEVELOPMENT',
+  facebook_url: 'https://www.facebook.com/HairathAcademy/',
+  whatsapp_number: process.env.WHATSAPP_NUMBER || '94777122951'
+};
 
-app.get('/api/admin/student-progress/:id',admin,(req,res)=>{
-  const id=Number(req.params.id);
-  const student=db.prepare("SELECT id,username,email FROM users WHERE id=? AND role='student'").get(id);
-  if(!student) return res.status(404).json({error:'Student not found.'});
-  const rows=db.prepare('SELECT course_name,video_index,watched_at FROM lesson_progress WHERE user_id=? ORDER BY course_name,video_index').all(id);
-  res.json({student,progress:rows});
-});
+const adminUsername =
+  process.env.ADMIN_USERNAME || 'admin';
 
-app.get('/api/student/progress', (req,res)=>{
-  const u=currentUser(req);
-  if(!u || u.role==='admin' || u.account_status!=='ACTIVE') return res.status(403).json({error:'Student access required'});
-  const rows=db.prepare('SELECT course_name,video_index,watched_at FROM lesson_progress WHERE user_id=? ORDER BY course_name,video_index').all(u.id);
-  res.json({progress:rows});
-});
+const adminPassword =
+  process.env.ADMIN_PASSWORD || 'ChangeMeNow!2026';
 
-app.post('/api/student/progress', (req,res)=>{
-  const u=currentUser(req);
-  if(!u || u.role==='admin' || u.account_status!=='ACTIVE') return res.status(403).json({error:'Student access required'});
-  const course=String(req.body?.course_name||'').trim();
-  const index=Number(req.body?.video_index);
-  if(!course || !Number.isInteger(index) || index<0) return res.status(400).json({error:'Invalid lesson progress.'});
-  db.prepare('INSERT INTO lesson_progress(user_id,course_name,video_index) VALUES(?,?,?) ON CONFLICT(user_id,course_name,video_index) DO UPDATE SET watched_at=CURRENT_TIMESTAMP').run(u.id,course,index);
-  res.json({ok:true});
-});
+const adminManagePassword =
+  process.env.ADMIN_MANAGE_PASSWORD || '3833';
 
 
-app.get('/api/admin/admins',admin,(req,res)=>{
-  const admins=db.prepare("SELECT id,username,email,account_status,created_at FROM users WHERE role='admin' ORDER BY id ASC").all();
-  res.json({admins});
+// ============================================================
+// EXPRESS
+// ============================================================
+
+app.use(express.json({ limit: '10mb' }));
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (origin) {
+    res.setHeader(
+      'Access-Control-Allow-Origin',
+      origin
+    );
+
+    res.setHeader('Vary', 'Origin');
+    res.setHeader(
+      'Access-Control-Allow-Credentials',
+      'true'
+    );
+
+    res.setHeader(
+      'Access-Control-Allow-Headers',
+      'Content-Type'
+    );
+
+    res.setHeader(
+      'Access-Control-Allow-Methods',
+      'GET,POST,PUT,DELETE,OPTIONS'
+    );
+  }
+
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+
+  next();
 });
 
-app.post('/api/admin/admins',admin,(req,res)=>{
-  const username=String(req.body?.username||'').trim();
-  const email=String(req.body?.email||'').trim()||null;
-  const password=String(req.body?.password||'');
-  if(!username||!password) return res.status(400).json({error:'Admin username and password are required.'});
-  if(!/^[A-Za-z0-9._-]{3,50}$/.test(username)) return res.status(400).json({error:'Username must be 3-50 characters (letters, numbers, dot, underscore or hyphen).'});
-  if(password.length<4) return res.status(400).json({error:'Password must contain at least 4 characters.'});
-  try{
-    const hash=bcrypt.hashSync(password,12);
-    const r=db.prepare('INSERT INTO users(username,email,password_hash,role,payment_status,access_level,account_status) VALUES(?,?,?,?,?,?,?)').run(username,email,hash,'admin','PAID','FULL_COURSE','ACTIVE');
-    res.json({admin:db.prepare("SELECT id,username,email,account_status,created_at FROM users WHERE id=?").get(r.lastInsertRowid)});
-  }catch(e){res.status(409).json({error:'Admin username or email already exists.'});}
-});
+app.use(
+  session({
+    secret:
+      process.env.SESSION_SECRET ||
+      'hairath-academy-change-this-secret',
 
-app.put('/api/admin/account',admin,(req,res)=>{
-  const id=req.session.userId;
-  const existing=db.prepare("SELECT * FROM users WHERE id=? AND role='admin'").get(id);
-  if(!existing) return res.status(404).json({error:'Admin account not found.'});
-  const username=String(req.body?.username ?? existing.username).trim();
-  const email=String(req.body?.email ?? existing.email ?? '').trim()||null;
-  const password=String(req.body?.password||'');
-  if(!username) return res.status(400).json({error:'Username is required.'});
-  try{
-    if(password){
-      if(password.length<4) return res.status(400).json({error:'Password must contain at least 4 characters.'});
-      const hash=bcrypt.hashSync(password,12);
-      db.prepare('UPDATE users SET username=?,email=?,password_hash=? WHERE id=?').run(username,email,hash,id);
-    } else db.prepare('UPDATE users SET username=?,email=? WHERE id=?').run(username,email,id);
-    res.json({user:safe(db.prepare('SELECT * FROM users WHERE id=?').get(id))});
-  }catch(e){res.status(409).json({error:'Username or email already exists.'});}
-});
+    resave: false,
 
-app.put('/api/admin/settings',admin,(req,res)=>{
-  const n=String(req.body?.whatsapp_number||'').replace(/[^0-9]/g,'');
-  if(!n) return res.status(400).json({error:'Invalid WhatsApp number'});
-  db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run('whatsapp_number',n);
-  res.json({ok:true,whatsapp_number:n});
-});
+    saveUninitialized: false,
 
-// Course and video management -------------------------------------------------
-app.get('/api/admin/courses',admin,(req,res)=>res.json({courses:getCourses()}));
-app.post('/api/admin/courses',adminManage,(req,res)=>{
-  const name=String(req.body?.name||'').trim();
-  const subtitle=String(req.body?.subtitle||'').trim();
-  const image=String(req.body?.image||'').trim();
-  if(!name) return res.status(400).json({error:'Course name is required.'});
-  const courses=getCourses();
-  if(courses.some(c=>c.name.toLowerCase()===name.toLowerCase())) return res.status(409).json({error:'A course with this name already exists.'});
-  const course={name,subtitle,image,videos:[]};
-  courses.push(course); saveCourses(courses); res.json({course,courses});
-});
-app.put('/api/admin/courses/:index',adminManage,(req,res)=>{
-  const index=Number(req.params.index); const courses=getCourses();
-  if(!Number.isInteger(index)||!courses[index]) return res.status(404).json({error:'Course not found.'});
-  const c=courses[index]; c.name=String(req.body?.name ?? c.name).trim(); c.subtitle=String(req.body?.subtitle ?? c.subtitle).trim(); c.image=String(req.body?.image ?? c.image).trim();
-  if(!c.name) return res.status(400).json({error:'Course name is required.'});
-  courses[index]=c; saveCourses(courses); res.json({course:c,courses});
-});
-app.delete('/api/admin/courses/:index',adminManage,(req,res)=>{
-  const index=Number(req.params.index); const courses=getCourses();
-  if(!Number.isInteger(index)||!courses[index]) return res.status(404).json({error:'Course not found.'});
-  courses.splice(index,1); saveCourses(courses); res.json({courses});
-});
-app.post('/api/admin/courses/:index/videos',adminManage,(req,res)=>{
-  const index=Number(req.params.index); const courses=getCourses(); const c=courses[index];
-  if(!c) return res.status(404).json({error:'Course not found.'});
-  const title=String(req.body?.title||'').trim(); const link=String(req.body?.link||'').trim(); const duration=String(req.body?.duration||'').trim(); const access=req.body?.access==='PREVIEW'?'PREVIEW':'FULL';
-  if(!title||!link) return res.status(400).json({error:'Video title and YouTube link are required.'});
-  const m=link.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([A-Za-z0-9_-]{11})/);
-  if(!m) return res.status(400).json({error:'Please enter a valid YouTube URL.'});
-  c.videos.push({title,source:'youtube',id:m[1],duration,access}); saveCourses(courses); res.json({course:c,courses});
-});
-app.put('/api/admin/courses/:courseIndex/videos/:videoIndex',adminManage,(req,res)=>{
-  const ci=Number(req.params.courseIndex),vi=Number(req.params.videoIndex),courses=getCourses(); const c=courses[ci];
-  if(!c||!c.videos[vi]) return res.status(404).json({error:'Video not found.'});
-  const v=c.videos[vi]; const title=String(req.body?.title ?? v.title).trim(); const link=String(req.body?.link ?? ('https://www.youtube.com/watch?v='+v.id)).trim(); const duration=String(req.body?.duration ?? v.duration ?? '').trim(); const access=req.body?.access==='PREVIEW'?'PREVIEW':'FULL';
-  const m=link.match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([A-Za-z0-9_-]{11})/); if(!m) return res.status(400).json({error:'Please enter a valid YouTube URL.'});
-  c.videos[vi]={...v,title,id:m[1],source:'youtube',duration,access}; saveCourses(courses); res.json({course:c,courses});
-});
-app.delete('/api/admin/courses/:courseIndex/videos/:videoIndex',adminManage,(req,res)=>{
-  const ci=Number(req.params.courseIndex),vi=Number(req.params.videoIndex),courses=getCourses(); const c=courses[ci];
-  if(!c||!c.videos[vi]) return res.status(404).json({error:'Video not found.'}); c.videos.splice(vi,1); saveCourses(courses); res.json({course:c,courses});
-});
-app.post('/api/admin/upload-image',adminManage,(req,res)=>{
-  const data=String(req.body?.data||''); const name=String(req.body?.name||'course-image').replace(/[^a-z0-9_-]/gi,'').slice(0,60)||'course-image';
-  const m=data.match(/^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/); if(!m) return res.status(400).json({error:'Only PNG, JPG or WEBP images are supported.'});
-  const ext=m[1]==='jpeg'?'jpg':m[1]; const buf=Buffer.from(m[2],'base64'); if(buf.length>3*1024*1024) return res.status(400).json({error:'Image must be 3 MB or smaller.'});
-  fs.mkdirSync(path.join(__dirname,'public','uploads'),{recursive:true}); const file=`${name}-${Date.now()}.${ext}`; fs.writeFileSync(path.join(__dirname,'public','uploads',file),buf); res.json({url:`/uploads/${file}`});
-});
-app.put('/api/admin/site-settings',admin,(req,res)=>{
-  const fields={academy_name:String(req.body?.academy_name||'HAIRATH ACADEMY').trim(),academy_tagline:String(req.body?.academy_tagline||'RESEARCH AND EDUCATION DEVELOPMENT').trim(),facebook_url:String(req.body?.facebook_url||'https://www.facebook.com/HairathAcademy/').trim()};
-  for(const [k,v] of Object.entries(fields)) db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(k,v);
-  res.json(fields);
-});
-app.get('*',(req,res)=>res.sendFile(path.join(__dirname,'public','index.html')));
-app.listen(PORT,()=>console.log(`Course platform running on http://localhost:${PORT}`));
+    cookie: {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure:
+        process.env.NODE_ENV === 'production',
+      maxAge: 1000 * 60 * 60 * 24 * 7
+    }
+  })
+);
+
+app.use(
+  express.static(
+    path.join(__dirname, 'public')
+  )
+);
+
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function safeStudent(student) {
+  if (!student) return null;
+
+  return {
+    id: student.id,
+    username: student.username,
+    email: student.email || '',
+    full_name: student.full_name || '',
+    payment_status: 'PAID',
+    access_level: 'FULL_COURSE',
+    account_status:
+      student.is_active === false
+        ? 'SUSPENDED'
+        : 'ACTIVE',
+    created_at: student.created_at
+  };
+}
+
+function safeAdmin(admin) {
+  if (!admin) return null;
+
+  return {
+    id: admin.id,
+    username: admin.username,
+    email: admin.email || '',
+    full_name: admin.full_name || '',
+    role: 'admin',
+    account_status:
+      admin.is_active === false
+        ? 'SUSPENDED'
+        : 'ACTIVE',
+    created_at: admin.created_at
+  };
+}
+
+async function getCurrentUser(req) {
+  if (!req.session.userId) {
+    return null;
+  }
+
+  if (req.session.userRole === 'admin') {
+    const { data, error } = await supabase
+      .from('admins')
+      .select('*')
+      .eq('id', req.session.userId)
+      .maybeSingle();
+
+    if (error || !data || !data.is_active) {
+      return null;
+    }
+
+    return {
+      ...data,
+      role: 'admin'
+    };
+  }
+
+  const { data, error } = await supabase
+    .from('students')
+    .select('*')
+    .eq('id', req.session.userId)
+    .maybeSingle();
+
+  if (error || !data || !data.is_active) {
+    return null;
+  }
+
+  return {
+    ...data,
+    role: 'student'
+  };
+}
+
+async function requireAdmin(req, res, next) {
+  const user = await getCurrentUser(req);
+
+  if (
+    !user ||
+    user.role !== 'admin' ||
+    !user.is_active
+  ) {
+    return res.status(403).json({
+      error: 'Admin access required'
+    });
+  }
+
+  req.user = user;
+
+  next();
+}
+
+async function requireAdminManagement(
+  req,
+  res,
+  next
+) {
+  const user = await getCurrentUser(req);
+
+  if (
+    !user ||
+    user.role !== 'admin' ||
+    !user.is_active
+  ) {
+    return res.status(403).json({
+      error: 'Admin access required'
+    });
+  }
+
+  const supplied =
+    String(
+      req.body?.manage_password || ''
+    );
+
+  if (supplied !== adminManagePassword) {
+    return res.status(403).json({
+      error:
+        'Management password is incorrect.'
+    });
+  }
+
+  req.user = user;
+
+  next();
+}
+
+function extractYouTubeId(url) {
+  const value = String(url || '').trim();
+
+  const match = value.match(
+    /(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|embed\/|shorts\/))([A-Za-z0-9_-]{11})/
+  );
+
+  return match ? match[1] : null;
+}
+
+function youtubeUrl(id) {
+  return `https://www.youtube.com/watch?v=${id}`;
+}
+
+
+// ============================================================
+// COURSES
+// ============================================================
+
+async function loadCourses() {
+  const { data, error } = await supabase
+    .from('courses')
+    .select(`
+      id,
+      title,
+      description,
+      thumbnail_url,
+      is_active,
+      display_order,
+      created_at,
+      updated_at,
+      course_videos (
+        id,
+        course_id,
+        title,
+        youtube_url,
+        duration,
+        is_locked,
+        is_active,
+        display_order,
+        created_at,
+        updated_at
+      )
+    `)
+    .eq('is_active', true)
+    .order('display_order', {
+      ascending: true
+    });
+
+  if (error) {
+    console.error(
+      'loadCourses error:',
+      error
+    );
+
+    throw error;
+  }
+
+  return (data || []).map(course => {
+    const videos =
+      (course.course_videos || [])
+        .filter(v => v.is_active !== false)
+        .sort(
+          (a, b) =>
+            (a.display_order || 0) -
+            (b.display_order || 0)
+        );
+
+    return {
+      id: course.id,
+
+      name: course.title,
+
+      title: course.title,
+
+      subtitle: course.description || '',
+
+      description:
+        course.description || '',
+
+      image:
+        course.thumbnail_url || '',
+
+      thumbnail_url:
+        course.thumbnail_url || '',
+
+      display_order:
+        course.display_order || 0,
+
+      videos: videos.map(video => {
+        const id =
+          extractYouTubeId(
+            video.youtube_url
+          );
+
+        return {
+          id: video.id,
+
+          title: video.title,
+
+          source: 'youtube',
+
+          youtube_url:
+            video.youtube_url,
+
+          link:
+            video.youtube_url,
+
+          video_id: id,
+
+          duration:
+            video.duration || '',
+
+          access:
+            video.is_locked
+              ? 'LOCKED'
+              : 'FULL',
+
+          is_locked:
+            !!video.is_locked,
+
+          locked:
+            !!video.is_locked
+        };
+      })
+    };
+  });
+}
+
+
+// ============================================================
+// HEALTH
+// ============================================================
+
+app.get(
+  '/api/health',
+  async (req, res) => {
+    try {
+      const { error } =
+        await supabase
+          .from('courses')
+          .select('id')
+          .limit(1);
+
+      if (error) {
+        return res.status(500).json({
+          ok: false,
+          service:
+            'hairath-academy-course-platform',
+          database: 'error',
+          error: error.message
+        });
+      }
+
+      res.json({
+        ok: true,
+        service:
+          'hairath-academy-course-platform',
+        database: 'supabase'
+      });
+    } catch (error) {
+      res.status(500).json({
+        ok: false,
+        error: error.message
+      });
+    }
+  }
+);
+
+
+// ============================================================
+// CONFIG
+// ============================================================
+
+app.get(
+  '/api/config',
+  (req, res) => {
+    res.json({
+      whatsapp_number:
+        appData.whatsapp_number,
+
+      academy_name:
+        appData.academy_name,
+
+      academy_tagline:
+        appData.academy_tagline,
+
+      facebook_url:
+        appData.facebook_url
+    });
+  }
+);
+
+
+// ============================================================
+// COURSES PUBLIC
+// ============================================================
+
+app.get(
+  '/api/courses',
+  async (req, res) => {
+    try {
+      const courses =
+        await loadCourses();
+
+      const user =
+        await getCurrentUser(req);
+
+      const isFullAccess =
+        user &&
+        (
+          user.role === 'admin' ||
+          user.role === 'student'
+        );
+
+      const output =
+        courses.map(course => ({
+          ...course,
+
+          videos:
+            course.videos.map(
+              (video, index) => {
+                let locked = true;
+
+                if (isFullAccess) {
+                  locked = false;
+                } else if (index === 0) {
+                  locked = false;
+                }
+
+                return {
+                  ...video,
+
+                  access:
+                    locked
+                      ? 'LOCKED'
+                      : 'PREVIEW',
+
+                  locked
+                };
+              }
+            )
+        }));
+
+      res.json({
+        courses: output
+      });
+
+    } catch (error) {
+      console.error(error);
+
+      res.status(500).json({
+        error:
+          'Unable to load courses.'
+      });
+    }
+  }
+);
+
+
+// ============================================================
+// CURRENT USER
+// ============================================================
+
+app.get(
+  '/api/me',
+  async (req, res) => {
+    try {
+      const user =
+        await getCurrentUser(req);
+
+      if (!user) {
+        return res.json({
+          user: null
+        });
+      }
+
+      res.json({
+        user:
+          user.role === 'admin'
+            ? safeAdmin(user)
+            : safeStudent(user)
+      });
+
+    } catch (error) {
+      res.json({
+        user: null
+      });
+    }
+  }
+);
+
+
+// ============================================================
+// LOGIN
+// ============================================================
+
+app.post(
+  '/api/login',
+  async (req, res) => {
+    try {
+      const username =
+        String(
+          req.body?.username || ''
+        ).trim();
+
+      const password =
+        String(
+          req.body?.password || ''
+        );
+
+      if (!username || !password) {
+        return res.status(400).json({
+          error:
+            'Username and password are required.'
+        });
+      }
+
+      // --------------------------
+      // ADMIN
+      // --------------------------
+
+      const adminResult =
+        await supabase
+          .from('admins')
+          .select('*')
+          .or(
+            `username.eq.${username}`
+          )
+          .maybeSingle();
+
+      if (
+        adminResult.data &&
+        adminResult.data.is_active
+      ) {
+        const valid =
+          await bcrypt.compare(
+            password,
+            adminResult.data.password_hash
+          );
+
+        if (valid) {
+          req.session.userId =
+            adminResult.data.id;
+
+          req.session.userRole =
+            'admin';
+
+          return res.json({
+            user:
+              safeAdmin(
+                adminResult.data
+              )
+          });
+        }
+      }
+
+      // --------------------------
+      // STUDENT
+      // --------------------------
+
+      const studentResult =
+        await supabase
+          .from('students')
+          .select('*')
+          .or(
+            `username.eq.${username},email.eq.${username}`
+          )
+          .maybeSingle();
+
+      if (
+        studentResult.data &&
+        studentResult.data.is_active
+      ) {
+        const valid =
+          await bcrypt.compare(
+            password,
+            studentResult.data.password_hash
+          );
+
+        if (valid) {
+          req.session.userId =
+            studentResult.data.id;
+
+          req.session.userRole =
+            'student';
+
+          return res.json({
+            user:
+              safeStudent(
+                studentResult.data
+              )
+          });
+        }
+      }
+
+      return res.status(401).json({
+        error:
+          'Invalid username/email or password.'
+      });
+
+    } catch (error) {
+      console.error(
+        'Login error:',
+        error
+      );
+
+      res.status(500).json({
+        error: 'Login failed.'
+      });
+    }
+  }
+);
+
+
+// ============================================================
+// LOGOUT
+// ============================================================
+
+app.post(
+  '/api/logout',
+  (req, res) => {
+    req.session.destroy(() => {
+      res.json({
+        ok: true
+      });
+    });
+  }
+);
+
+
+// ============================================================
+// MANAGEMENT PASSWORD VERIFY
+// ============================================================
+
+app.post(
+  '/api/admin/verify-management',
+  requireAdmin,
+  (req, res) => {
+    const supplied =
+      String(
+        req.body?.manage_password || ''
+      );
+
+    if (
+      supplied !== adminManagePassword
+    ) {
+      return res.status(403).json({
+        error:
+          'Management password is incorrect.'
+      });
+    }
+
+    res.json({
+      ok: true
+    });
+  }
+);
+
+
+// ============================================================
+// STUDENTS
+// ============================================================
+
+app.get(
+  '/api/admin/students',
+  requireAdmin,
+  async (req, res) => {
+    const { data, error } =
+      await supabase
+        .from('students')
+        .select(
+          'id,username,email,full_name,is_active,created_at'
+        )
+        .order(
+          'created_at',
+          { ascending: false }
+        );
+
+    if (error) {
+      return res.status(500).json({
+        error: error.message
+      });
+    }
+
+    res.json({
+      students:
+        (data || []).map(
+          safeStudent
+        )
+    });
+  }
+);
+
+
+// ============================================================
+// ADD STUDENT
+// ============================================================
+
+app.post(
+  '/api/admin/students',
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const username =
+        String(
+          req.body?.username || ''
+        ).trim();
+
+      const email =
+        String(
+          req.body?.email || ''
+        ).trim() || null;
+
+      const full_name =
+        String(
+          req.body?.full_name || ''
+        ).trim();
+
+      const password =
+        String(
+          req.body?.password || ''
+        );
+
+      if (!username || !password) {
+        return res.status(400).json({
+          error:
+            'Username and password are required.'
+        });
+      }
+
+      if (
+        !/^[A-Za-z0-9._-]{3,50}$/.test(
+          username
+        )
+      ) {
+        return res.status(400).json({
+          error:
+            'Username must contain 3-50 letters, numbers, dot, underscore or hyphen.'
+        });
+      }
+
+      if (password.length < 4) {
+        return res.status(400).json({
+          error:
+            'Password must contain at least 4 characters.'
+        });
+      }
+
+      const password_hash =
+        await bcrypt.hash(
+          password,
+          12
+        );
+
+      const { data, error } =
+        await supabase
+          .from('students')
+          .insert({
+            username,
+            email,
+            full_name,
+            password_hash,
+            is_active: true
+          })
+          .select()
+          .single();
+
+      if (error) {
+        return res.status(409).json({
+          error:
+            'Username or email already exists.'
+        });
+      }
+
+      res.json({
+        student:
+          safeStudent(data)
+      });
+
+    } catch (error) {
+      res.status(500).json({
+        error:
+          'Unable to create student.'
+      });
+    }
+  }
+);
+
+
+// ============================================================
+// EDIT STUDENT
+// ============================================================
+
+app.put(
+  '/api/admin/students/:id',
+  requireAdmin,
+  async (req, res) => {
+    const id =
+      req.params.id;
+
+    const { data: existing } =
+      await supabase
+        .from('students')
+        .select('*')
+        .eq('id', id)
+        .maybeSingle();
+
+    if (!existing) {
+      return res.status(404).json({
+        error:
+          'Student not found.'
+      });
+    }
+
+    const updates = {};
+
+    if (
+      req.body.username !==
+      undefined
+    ) {
+      updates.username =
+        String(
+          req.body.username
+        ).trim();
+    }
+
+    if (
+      req.body.email !==
+      undefined
+    ) {
+      updates.email =
+        String(
+          req.body.email || ''
+        ).trim() || null;
+    }
+
+    if (
+      req.body.full_name !==
+      undefined
+    ) {
+      updates.full_name =
+        String(
+          req.body.full_name || ''
+        ).trim();
+    }
+
+    if (
+      req.body.account_status !==
+      undefined
+    ) {
+      updates.is_active =
+        req.body.account_status ===
+        'ACTIVE';
+    }
+
+    if (req.body.password) {
+      if (
+        String(req.body.password)
+          .length < 4
+      ) {
+        return res.status(400).json({
+          error:
+            'Password must contain at least 4 characters.'
+        });
+      }
+
+      updates.password_hash =
+        await bcrypt.hash(
+          String(req.body.password),
+          12
+        );
+    }
+
+    const { data, error } =
+      await supabase
+        .from('students')
+        .update(updates)
+        .eq('id', id)
+        .select()
+        .single();
+
+    if (error) {
+      return res.status(409).json({
+        error:
+          'Unable to update student.'
+      });
+    }
+
+    res.json({
+      student:
+        safeStudent(data)
+    });
+  }
+);
+
+
+// ============================================================
+// DELETE STUDENT
+// ============================================================
+
+app.delete(
+  '/api/admin/students/:id',
+  requireAdmin,
+  async (req, res) => {
+    const { error } =
+      await supabase
+        .from('students')
+        .delete()
+        .eq(
+          'id',
+          req.params.id
+        );
+
+    if (error) {
+      return res.status(500).json({
+        error: error.message
+      });
+    }
+
+    res.json({
+      ok: true
+    });
+  }
+);
+
+
+// ============================================================
+// ADMINS
+// ============================================================
+
+app.get(
+  '/api/admin/admins',
+  requireAdmin,
+  async (req, res) => {
+    const { data, error } =
+      await supabase
+        .from('admins')
+        .select(
+          'id,username,full_name,is_active,created_at'
+        )
+        .order(
+          'created_at',
+          { ascending: true }
+        );
+
+    if (error) {
+      return res.status(500).json({
+        error: error.message
+      });
+    }
+
+    res.json({
+      admins:
+        (data || []).map(
+          safeAdmin
+        )
+    });
+  }
+);
+
+
+// ============================================================
+// ADD ADMIN
+// ============================================================
+
+app.post(
+  '/api/admin/admins',
+  requireAdmin,
+  async (req, res) => {
+    const username =
+      String(
+        req.body?.username || ''
+      ).trim();
+
+    const full_name =
+      String(
+        req.body?.full_name || ''
+      ).trim();
+
+    const password =
+      String(
+        req.body?.password || ''
+      );
+
+    if (!username || !password) {
+      return res.status(400).json({
+        error:
+          'Admin username and password are required.'
+      });
+    }
+
+    const password_hash =
+      await bcrypt.hash(
+        password,
+        12
+      );
+
+    const { data, error } =
+      await supabase
+        .from('admins')
+        .insert({
+          username,
+          full_name,
+          password_hash,
+          is_active: true
+        })
+        .select()
+        .single();
+
+    if (error) {
+      return res.status(409).json({
+        error:
+          'Admin username already exists.'
+      });
+    }
+
+    res.json({
+      admin:
+        safeAdmin(data)
+    });
+  }
+);
+
+
+// ============================================================
+// COURSE ADMIN
+// ============================================================
+
+app.get(
+  '/api/admin/courses',
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const courses =
+        await loadCourses();
+
+      res.json({
+        courses
+      });
+
+    } catch (error) {
+      res.status(500).json({
+        error: error.message
+      });
+    }
+  }
+);
+
+
+// ============================================================
+// ADD COURSE
+// ============================================================
+
+app.post(
+  '/api/admin/courses',
+  requireAdminManagement,
+  async (req, res) => {
+    const title =
+      String(
+        req.body?.title ||
+        req.body?.name ||
+        ''
+      ).trim();
+
+    const description =
+      String(
+        req.body?.description ||
+        req.body?.subtitle ||
+        ''
+      ).trim();
+
+    const thumbnail_url =
+      String(
+        req.body?.thumbnail_url ||
+        req.body?.image ||
+        ''
+      ).trim();
+
+    if (!title) {
+      return res.status(400).json({
+        error:
+          'Course name is required.'
+      });
+    }
+
+    const { data: duplicate } =
+      await supabase
+        .from('courses')
+        .select('id')
+        .ilike(
+          'title',
+          title
+        )
+        .maybeSingle();
+
+    if (duplicate) {
+      return res.status(409).json({
+        error:
+          'A course with this name already exists.'
+      });
+    }
+
+    const { data, error } =
+      await supabase
+        .from('courses')
+        .insert({
+          title,
+          description,
+          thumbnail_url,
+          is_active: true,
+          display_order: 9999
+        })
+        .select()
+        .single();
+
+    if (error) {
+      return res.status(500).json({
+        error: error.message
+      });
+    }
+
+    res.json({
+      course: {
+        id: data.id,
+        name: data.title,
+        title: data.title,
+        subtitle:
+          data.description || '',
+        description:
+          data.description || '',
+        image:
+          data.thumbnail_url || '',
+        thumbnail_url:
+          data.thumbnail_url || '',
+        videos: []
+      }
+    });
+  }
+);
+
+
+// ============================================================
+// EDIT COURSE
+// ============================================================
+
+app.put(
+  '/api/admin/courses/:id',
+  requireAdminManagement,
+  async (req, res) => {
+    const updates = {};
+
+    if (
+      req.body.title !==
+      undefined ||
+      req.body.name !==
+      undefined
+    ) {
+      updates.title =
+        String(
+          req.body.title ??
+          req.body.name
+        ).trim();
+    }
+
+    if (
+      req.body.description !==
+      undefined ||
+      req.body.subtitle !==
+      undefined
+    ) {
+      updates.description =
+        String(
+          req.body.description ??
+          req.body.subtitle ??
+          ''
+        ).trim();
+    }
+
+    if (
+      req.body.thumbnail_url !==
+      undefined ||
+      req.body.image !==
+      undefined
+    ) {
+      updates.thumbnail_url =
+        String(
+          req.body.thumbnail_url ??
+          req.body.image ??
+          ''
+        ).trim();
+    }
+
+    const { data, error } =
+      await supabase
+        .from('courses')
+        .update(updates)
+        .eq(
+          'id',
+          req.params.id
+        )
+        .select()
+        .single();
+
+    if (error) {
+      return res.status(500).json({
+        error: error.message
+      });
+    }
+
+    res.json({
+      course: {
+        id: data.id,
+        name: data.title,
+        title: data.title,
+        subtitle:
+          data.description || '',
+        description:
+          data.description || '',
+        image:
+          data.thumbnail_url || '',
+        thumbnail_url:
+          data.thumbnail_url || ''
+      }
+    });
+  }
+);
+
+
+// ============================================================
+// DELETE COURSE
+// ============================================================
+
+app.delete(
+  '/api/admin/courses/:id',
+  requireAdminManagement,
+  async (req, res) => {
+    const { error } =
+      await supabase
+        .from('courses')
+        .delete()
+        .eq(
+          'id',
+          req.params.id
+        );
+
+    if (error) {
+      return res.status(500).json({
+        error: error.message
+      });
+    }
+
+    res.json({
+      ok: true
+    });
+  }
+);
+
+
+// ============================================================
+// ADD VIDEO
+// ============================================================
+
+app.post(
+  '/api/admin/courses/:courseId/videos',
+  requireAdminManagement,
+  async (req, res) => {
+    const title =
+      String(
+        req.body?.title || ''
+      ).trim();
+
+    const link =
+      String(
+        req.body?.link ||
+        req.body?.youtube_url ||
+        ''
+      ).trim();
+
+    const duration =
+      String(
+        req.body?.duration || ''
+      ).trim();
+
+    const youtubeId =
+      extractYouTubeId(link);
+
+    if (!title || !link) {
+      return res.status(400).json({
+        error:
+          'Video title and YouTube link are required.'
+      });
+    }
+
+    if (!youtubeId) {
+      return res.status(400).json({
+        error:
+          'Please enter a valid YouTube URL.'
+      });
+    }
+
+    const { data: course } =
+      await supabase
+        .from('courses')
+        .select('id')
+        .eq(
+          'id',
+          req.params.courseId
+        )
+        .maybeSingle();
+
+    if (!course) {
+      return res.status(404).json({
+        error:
+          'Course not found.'
+      });
+    }
+
+    const { data: video, error } =
+      await supabase
+        .from('course_videos')
+        .insert({
+          course_id:
+            req.params.courseId,
+
+          title,
+
+          youtube_url:
+            youtubeUrl(youtubeId),
+
+          duration,
+
+          is_locked: false,
+
+          is_active: true,
+
+          display_order: 9999
+        })
+        .select()
+        .single();
+
+    if (error) {
+      return res.status(500).json({
+        error: error.message
+      });
+    }
+
+    res.json({
+      video
+    });
+  }
+);
+
+
+// ============================================================
+// EDIT VIDEO
+// ============================================================
+
+app.put(
+  '/api/admin/courses/:courseId/videos/:videoId',
+  requireAdminManagement,
+  async (req, res) => {
+    const updates = {};
+
+    if (
+      req.body.title !==
+      undefined
+    ) {
+      updates.title =
+        String(
+          req.body.title
+        ).trim();
+    }
+
+    if (
+      req.body.link !==
+      undefined ||
+      req.body.youtube_url !==
+      undefined
+    ) {
+      const link =
+        String(
+          req.body.link ??
+          req.body.youtube_url ??
+          ''
+        ).trim();
+
+      const id =
+        extractYouTubeId(link);
+
+      if (!id) {
+        return res.status(400).json({
+          error:
+            'Please enter a valid YouTube URL.'
+        });
+      }
+
+      updates.youtube_url =
+        youtubeUrl(id);
+    }
+
+    if (
+      req.body.duration !==
+      undefined
+    ) {
+      updates.duration =
+        String(
+          req.body.duration || ''
+        ).trim();
+    }
+
+    if (
+      req.body.is_locked !==
+      undefined
+    ) {
+      updates.is_locked =
+        !!req.body.is_locked;
+    }
+
+    if (
+      req.body.access !==
+      undefined
+    ) {
+      updates.is_locked =
+        req.body.access ===
+        'LOCKED';
+    }
+
+    const { data, error } =
+      await supabase
+        .from('course_videos')
+        .update(updates)
+        .eq(
+          'id',
+          req.params.videoId
+        )
+        .eq(
+          'course_id',
+          req.params.courseId
+        )
+        .select()
+        .single();
+
+    if (error) {
+      return res.status(500).json({
+        error: error.message
+      });
+    }
+
+    res.json({
+      video: data
+    });
+  }
+);
+
+
+// ============================================================
+// DELETE VIDEO
+// ============================================================
+
+app.delete(
+  '/api/admin/courses/:courseId/videos/:videoId',
+  requireAdminManagement,
+  async (req, res) => {
+    const { error } =
+      await supabase
+        .from('course_videos')
+        .delete()
+        .eq(
+          'id',
+          req.params.videoId
+        )
+        .eq(
+          'course_id',
+          req.params.courseId
+        );
+
+    if (error) {
+      return res.status(500).json({
+        error: error.message
+      });
+    }
+
+    res.json({
+      ok: true
+    });
+  }
+);
+
+
+// ============================================================
+// LOCK / UNLOCK VIDEO
+// ============================================================
+
+app.put(
+  '/api/admin/videos/:videoId/lock',
+  requireAdminManagement,
+  async (req, res) => {
+    const locked =
+      req.body?.locked !==
+      undefined
+        ? !!req.body.locked
+        : true;
+
+    const { data, error } =
+      await supabase
+        .from('course_videos')
+        .update({
+          is_locked: locked
+        })
+        .eq(
+          'id',
+          req.params.videoId
+        )
+        .select()
+        .single();
+
+    if (error) {
+      return res.status(500).json({
+        error: error.message
+      });
+    }
+
+    res.json({
+      ok: true,
+      video: data
+    });
+  }
+);
+
+
+// ============================================================
+// UPLOAD COURSE THUMBNAIL
+// ============================================================
+
+app.post(
+  '/api/admin/upload-image',
+  requireAdminManagement,
+  async (req, res) => {
+    try {
+      const data =
+        String(
+          req.body?.data || ''
+        );
+
+      const name =
+        String(
+          req.body?.name ||
+          'course-image'
+        )
+          .replace(
+            /[^a-z0-9_-]/gi,
+            ''
+          )
+          .slice(0, 60) ||
+        'course-image';
+
+      const match =
+        data.match(
+          /^data:image\/(png|jpeg|jpg|webp);base64,(.+)$/
+        );
+
+      if (!match) {
+        return res.status(400).json({
+          error:
+            'Only PNG, JPG or WEBP images are supported.'
+        });
+      }
+
+      const ext =
+        match[1] === 'jpeg'
+          ? 'jpg'
+          : match[1];
+
+      const buffer =
+        Buffer.from(
+          match[2],
+          'base64'
+        );
+
+      if (
+        buffer.length >
+        3 * 1024 * 1024
+      ) {
+        return res.status(400).json({
+          error:
+            'Image must be 3 MB or smaller.'
+        });
+      }
+
+      const fileName =
+        `${name}-${Date.now()}.${ext}`;
+
+      const { error } =
+        await supabase
+          .storage
+          .from(
+            'course-thumbnails'
+          )
+          .upload(
+            fileName,
+            buffer,
+            {
+              contentType:
+                `image/${ext === 'jpg' ? 'jpeg' : ext}`,
+              upsert: false
+            }
+          );
+
+      if (error) {
+        return res.status(500).json({
+          error:
+            'Image upload failed: ' +
+            error.message
+        });
+      }
+
+      const { data: publicData } =
+        supabase
+          .storage
+          .from(
+            'course-thumbnails'
+          )
+          .getPublicUrl(
+            fileName
+          );
+
+      res.json({
+        url:
+          publicData.publicUrl,
+
+        path:
+          fileName
+      });
+
+    } catch (error) {
+      res.status(500).json({
+        error:
+          'Image upload failed.'
+      });
+    }
+  }
+);
+
+
+// ============================================================
+// SITE SETTINGS
+// ============================================================
+
+app.put(
+  '/api/admin/site-settings',
+  requireAdmin,
+  (req, res) => {
+    if (
+      req.body.academy_name
+    ) {
+      appData.academy_name =
+        String(
+          req.body.academy_name
+        ).trim();
+    }
+
+    if (
+      req.body.academy_tagline
+    ) {
+      appData.academy_tagline =
+        String(
+          req.body.academy_tagline
+        ).trim();
+    }
+
+    if (
+      req.body.facebook_url
+    ) {
+      appData.facebook_url =
+        String(
+          req.body.facebook_url
+        ).trim();
+    }
+
+    res.json({
+      ...appData
+    });
+  }
+);
+
+
+// ============================================================
+// WHATSAPP
+// ============================================================
+
+app.put(
+  '/api/admin/settings',
+  requireAdmin,
+  (req, res) => {
+    const number =
+      String(
+        req.body?.whatsapp_number ||
+        ''
+      ).replace(
+        /[^0-9]/g,
+        ''
+      );
+
+    if (!number) {
+      return res.status(400).json({
+        error:
+          'Invalid WhatsApp number.'
+      });
+    }
+
+    appData.whatsapp_number =
+      number;
+
+    res.json({
+      ok: true,
+      whatsapp_number:
+        number
+    });
+  }
+);
+
+
+// ============================================================
+// STUDENT PROGRESS
+// ============================================================
+
+app.get(
+  '/api/student/progress',
+  async (req, res) => {
+    const user =
+      await getCurrentUser(req);
+
+    if (
+      !user ||
+      user.role !== 'student'
+    ) {
+      return res.status(403).json({
+        error:
+          'Student access required'
+      });
+    }
+
+    const { data, error } =
+      await supabase
+        .from(
+          'student_video_access'
+        )
+        .select(`
+          video_id,
+          last_watched_at
+        `)
+        .eq(
+          'student_id',
+          user.id
+        );
+
+    if (error) {
+      return res.status(500).json({
+        error: error.message
+      });
+    }
+
+    res.json({
+      progress:
+        data || []
+    });
+  }
+);
+
+
+// ============================================================
+// SAVE STUDENT VIDEO PROGRESS
+// ============================================================
+
+app.post(
+  '/api/student/progress',
+  async (req, res) => {
+    const user =
+      await getCurrentUser(req);
+
+    if (
+      !user ||
+      user.role !== 'student'
+    ) {
+      return res.status(403).json({
+        error:
+          'Student access required'
+      });
+    }
+
+    const videoId =
+      req.body?.video_id;
+
+    if (!videoId) {
+      return res.status(400).json({
+        error:
+          'video_id is required.'
+      });
+    }
+
+    const { error } =
+      await supabase
+        .from(
+          'student_video_access'
+        )
+        .upsert(
+          {
+            student_id:
+              user.id,
+
+            video_id:
+              videoId,
+
+            last_watched_at:
+              new Date().toISOString()
+          },
+          {
+            onConflict:
+              'student_id,video_id'
+          }
+        );
+
+    if (error) {
+      return res.status(500).json({
+        error: error.message
+      });
+    }
+
+    res.json({
+      ok: true
+    });
+  }
+);
+
+
+// ============================================================
+// ADMIN STUDENT PROGRESS
+// ============================================================
+
+app.get(
+  '/api/admin/student-progress/:id',
+  requireAdmin,
+  async (req, res) => {
+    const studentId =
+      req.params.id;
+
+    const { data: student } =
+      await supabase
+        .from('students')
+        .select(
+          'id,username,email,full_name'
+        )
+        .eq(
+          'id',
+          studentId
+        )
+        .maybeSingle();
+
+    if (!student) {
+      return res.status(404).json({
+        error:
+          'Student not found.'
+      });
+    }
+
+    const { data, error } =
+      await supabase
+        .from(
+          'student_video_access'
+        )
+        .select('*')
+        .eq(
+          'student_id',
+          studentId
+        );
+
+    if (error) {
+      return res.status(500).json({
+        error: error.message
+      });
+    }
+
+    res.json({
+      student,
+      progress:
+        data || []
+    });
+  }
+);
+
+
+// ============================================================
+// LOGIN HISTORY
+// ============================================================
+
+app.get(
+  '/api/admin/login-history',
+  requireAdmin,
+  (req, res) => {
+    res.json({
+      history: []
+    });
+  }
+);
+
+
+// ============================================================
+// ROOT / SPA
+// ============================================================
+
+app.get(
+  '*',
+  (req, res) => {
+    const indexPath =
+      path.join(
+        __dirname,
+        'public',
+        'index.html'
+      );
+
+    if (
+      fs.existsSync(indexPath)
+    ) {
+      return res.sendFile(
+        indexPath
+      );
+    }
+
+    res.status(404).send(
+      'HAIRATH ACADEMY'
+    );
+  }
+);
+
+
+// ============================================================
+// START SERVER
+// ============================================================
+
+app.listen(
+  PORT,
+  '0.0.0.0',
+  () => {
+    console.log(
+      `HAIRATH ACADEMY running on port ${PORT}`
+    );
+  }
+);
